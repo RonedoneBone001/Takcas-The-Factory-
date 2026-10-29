@@ -7,7 +7,7 @@ FACTORY_DIR = os.path.expanduser("~/takcas_factory")
 SANDBOX_DIR = os.path.join(FACTORY_DIR, "sandbox")
 SOURCE_FILE = os.path.join(FACTORY_DIR, "draft_final.py")
 TARGET_FILE = os.path.join(SANDBOX_DIR, "app.py")
-TIMEOUT = 10
+TIMEOUT = 15 # Увеличили таймаут для тестов
 BLACKLIST = [r"os\.remove", r"os\.unlink", r"shutil\.rmtree", r"shutil\.move", r"subprocess\.run.*rm\s", r"os\.system", r"eval\(", r"exec\(", r"__import__\('os'\)", r"open\(.*['\"]\/", r"open\(.*['\"]~"]
 
 def is_safe(code):
@@ -32,7 +32,7 @@ def main():
         process = subprocess.Popen(["python", TARGET_FILE], cwd=SANDBOX_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = process.communicate(timeout=TIMEOUT)
         if process.returncode == 0:
-            print("[SANDBOX] УСПЕХ (завершился с кодом 0)")
+            print("[SANDBOX] УСПЕХ (код и тесты прошли)")
             with open(os.path.join(SANDBOX_DIR, "sandbox_success.log"), "w", encoding="utf-8") as f: f.write("OK")
         else:
             print(f"[SANDBOX] ОШИБКА (упал с кодом {process.returncode})")

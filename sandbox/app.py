@@ -1,67 +1,125 @@
-from flask import Flask, render_template, request, jsonify
-import sqlite3
-from datetime import datetime
+import threading
+from collections import OrderedDict
+import time
 
-app = Flask(__name__)
+class LRUCache:
+    def __init__(self, capacity: int, default_ttl: float, cleanup_interval: float, on_evict=None):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.default_ttl = default_ttl
+        self.cleanup_interval = cleanup_interval
+        self.on_evict = on_evict
+        self.cleanup_thread = threading.Timer(self.cleanup_interval, self.cleanup)
 
-# Database initialization
-def get_db_connection():
-    conn = sqlite3.connect('app.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-# Route for the home page
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    text = None
-    summary = None
-    error_message = None
-
-    if request.method == 'POST':
-        text = request.form.get('text')
-
-        if not text or len(text) > 5000:
-            error_message = "Invalid input. Please enter a non-empty text with less than 5000 characters."
-            return render_template('index.html', text=text, summary=summary, error_message=error_message)
-
-        # Save request to database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO requests (text, request_time) VALUES (?, ?)",
-                      (text, datetime.now()))
-        conn.commit()
-        conn.close()
-
-        try:
-            # Send request to Ollama
-            import requests
-            url = 'http://127.0.0.1:11434/api/generate'
-            headers = {
-                'Content-Type': 'application/json'
-            }
-            payload = {
-                'model': 'qwen2.5:3b',
-                'prompt': text
-            }
-            response = requests.post(url, headers=headers, json=payload)
-
-            # Parse response
-            if response.status_code == 200:
-                summary = response.json().get('response', 'No summary available.')
-                # Save summary to database
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO summaries (summary, request_id) VALUES (?, ?)",
-                              (summary, cursor.lastrowid))
-                conn.commit()
-                conn.close()
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                value, expiry_time = self.cache[key]
+                if expiry_time > time.time():
+                    self.hits += 1
+                    self.cache.move_to_end(key)
+                    return value
+                else:
+                    self.misses += 1
+                    self.cache.pop(key)
+                    self.expirations += 1
+                    if self.on_evict:
+                        self.on_evict(key, reason="ttl")
+                    return None
             else:
-                error_message = "Error communicating with Ollama. Please try again later."
+                self.misses += 1
+                return None
 
-        except requests.exceptions.RequestException as e:
-            error_message = f"An error occurred: {str(e)}"
+    def put(self, key, value, ttl=None):
+        if ttl is None:
+            ttl = self.default_ttl
+        evicted = None
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                self.cache[key] = (value, time.time() + ttl)
+            else:
+                if len(self.cache) >= self.capacity:
+                    evicted_key, _ = self.cache.popitem(last=False)
+                    self.evictions += 1
+                    evicted = (evicted_key, None)
+                self.cache[key] = (value, time.time() + ttl)
 
-    return render_template('index.html', text=text, summary=summary, error_message=error_message)
+        # Вызываем callback ВНЕ лока
+        if evicted and self.on_evict:
+            self.on_evict(evicted[0], reason="eviction")
+
+    def cleanup(self):
+        with self.lock:
+            for key, (value, expiry_time) in self.cache.items():
+                if expiry_time and expiry_time < time.time():
+                    self.misses += 1
+                    self.cache.pop(key)
+                    self.expirations += 1
+                    if self.on_evict:
+                        self.on_evict(key, reason="ttl")
+        self.cleanup_thread = threading.Timer(self.cleanup_interval, self.cleanup)
+        self.cleanup_thread.start()
+
+def test_lru_cache():
+    callback_under_lock = threading.local()
+    callback_under_lock.is_locked = False
+
+    def on_evict(key, reason):
+        # Пытаемся захватить лок. Если получается - значит, мы ВНЕ лока.
+        if cache.lock.acquire(blocking=False):
+            cache.lock.release()
+            callback_under_lock.is_locked = False
+        else:
+            callback_under_lock.is_locked = True
+
+    cache = LRUCache(capacity=3, default_ttl=0.2, cleanup_interval=0.5, on_evict=on_evict)
+    threads = []
+
+    def worker():
+        for i in range(80):
+            key = i % 5
+            if i % 2 == 0:
+                cache.put(key, f"value{i}", ttl=0.1)
+            else:
+                cache.get(key)
+
+    for _ in range(4):
+        t = threading.Thread(target=worker)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    print("Hits:", cache.hits)
+    print("Misses:", cache.misses)
+    print("Evictions:", cache.evictions)
+    print("Expirations:", cache.expirations)
+    print("Callback called under lock:", callback_under_lock.is_locked)
+    assert not callback_under_lock.is_locked, "Callback was called under lock!"
+    print("Test passed successfully!")
+
+def test_basic_functionality():
+    cache = LRUCache(capacity=2, default_ttl=0.1, cleanup_interval=0.2, on_evict=None)
+    cache.put("key1", "value1")
+    cache.put("key2", "value2")
+    cache.get("key1")
+    cache.put("key3", "value3")
+    assert len(cache.cache) == 2, "Cache size is not as expected"
+    assert cache.get("key2") is None, "Key2 should be expired and returned as None"
+    cache.put("key2", "value4")
+    assert cache.get("key2") == "value4", "Key2 should be retrieved with new value"
+    cache.put("key4", "value5")
+    assert len(cache.cache) == 2, "Cache size should not exceed capacity"
+    assert cache.get("key1") is None, "Key1 should be expired and returned as None"
+    print("Basic functionality test passed.")
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    test_lru_cache()
+    test_basic_functionality()

@@ -1,5 +1,7 @@
 import os
+import ast
 from llm_core import ask_model, clean_code
+
 FACTORY_DIR = os.path.expanduser("~/takcas_factory")
 DRAFT_FILE = os.path.join(FACTORY_DIR, "draft_analyzed.py")
 TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
@@ -27,16 +29,26 @@ def main():
     if syntax_err and "УСПЕХ" not in syntax_err.upper(): errors_text += f"Syntax: {syntax_err}\n"
     if coder_err and "УСПЕХ" not in coder_err.upper(): errors_text += f"Code Quality: {coder_err}\n"
     
-    if not errors_text:
-        print("[JUDGE] Ошибок нет, код идеален.")
-        with open(DRAFT_FINAL, "w", encoding="utf-8") as f: f.write(current_code)
-        return
-
-    print("[JUDGE] Исправляем ошибки...")
-    prompt = f"Task: {task}\nCode:\n{current_code}\nErrors found by critics:\n{errors_text}\nFix the code according to the errors. Return ONLY Python code."
+    print("[JUDGE] Финальная проверка и генерация тестов...")
+    prompt = (
+        f"Task: {task}\n"
+        f"Code:\n{current_code}\n"
+        f"Errors found by critics:\n{errors_text if errors_text else 'None.'}\n"
+        "Fix any remaining errors. THEN, add a simple test at the end of the file inside `if __name__ == '__main__':` using `assert` to verify basic functionality. Return ONLY Python code."
+    )
+    
     result = ask_model(MODEL, prompt, max_tokens=1500)
     if result:
         clean = clean_code(result)
-        with open(DRAFT_FINAL, "w", encoding="utf-8") as f: f.write(clean)
-        print("[JUDGE] Финальный код сохранен.")
+        if len(clean) > 10 and "def " in clean:
+            try:
+                ast.parse(clean)
+                with open(DRAFT_FINAL, "w", encoding="utf-8") as f: f.write(clean)
+                print("[JUDGE] Финальный код с тестом сохранен.")
+            except SyntaxError:
+                print("[JUDGE] ОШИБКА: Невалидный синтаксис. Оставляю старый код.")
+                with open(DRAFT_FINAL, "w", encoding="utf-8") as f: f.write(current_code)
+        else:
+            print("[JUDGE] ОШИБКА: Пустой код. Оставляю старый.")
+            with open(DRAFT_FINAL, "w", encoding="utf-8") as f: f.write(current_code)
 if __name__ == "__main__": main()
