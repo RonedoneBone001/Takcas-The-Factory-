@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<head><title>Takcas Prime</title></head>
+<body>
+    <h1>Привет от нейросетей!</h1>
+    <form method="POST">
+        <textarea name="text" rows="5" cols="40"></textarea><br>
+        <button type="submit">Отправить</button>
+    </form>
+    {% if summary %}<h2>Результат: {{ summary }}</h2>{% endif %}
+</body>
+</html>

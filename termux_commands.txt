@@ -1,0 +1,8 @@
+- termux-torch on  |  ["termux-torch", "on"]
+- termux-torch off  |  ["termux-torch", "off"]
+- termux-brightness <0-255>  |  ["termux-brightness", "<0-255>"]
+- termux-volume music <0-15>  |  ["termux-volume", "music", "<0-15>"]
+- termux-camera-photo -c 0 <path>  |  ["termux-camera-photo", "-c", "0", "<path>"]
+- termux-clipboard-set <text>  |  ["termux-clipboard-set", "<text>"]
+- termux-tts-speak <text>  |  ["termux-tts-speak", "<text>"]
+- am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p <package_name>  |  ["am", "start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", "-p", "<package_name>"]

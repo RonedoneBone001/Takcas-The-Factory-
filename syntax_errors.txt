@@ -1,0 +1,45 @@
+```python
+from flask import Flask, render_template, request, jsonify
+import sqlite3
+from datetime import datetime
+import requests
+
+app = Flask(__name__)
+
+# Database initialization
+def get_db_connection():
+    conn = sqlite3.connect('app.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Route for the home page
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    text = None
+    summary = None
+    error_message = None
+
+    if request.method == 'POST':
+        text = request.form.get('text')
+
+        if not text or len(text) > 5000:
+            error_message = "Invalid input. Please enter a non-empty text with less than 5000 characters."
+            return render_template('index.html', text=text, summary=summary, error_message=error_message)
+
+        # Save request to database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO requests (text, request_time) VALUES (?, ?)",
+                      (text, datetime.now()))
+        conn.commit()
+        conn.close()
+
+        try:
+            # Send request to Ollama
+            import requests
+            url = 'http://127.0.0.1:11434/api/generate'
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                'model': 'qwen2.5

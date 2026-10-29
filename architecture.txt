@@ -1,0 +1,2407 @@
+=== FILE: ./sandbox/voice_jarvis.py ===
+import threading
+import time
+from collections import OrderedDict
+
+class TTLCache:
+    def __init__(self, capacity: int, default_ttl: float, cleanup_interval:[17D[K
+cleanup_interval: float):
+        self.capacity = capacity
+        self.default_ttl = default_ttl
+        self.cleanup_interval = cleanup_interval
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.on_evict = None
+
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.hits += 1
+                self._update_ttl(key)
+                return self.cache[key]
+            else:
+                self.misses += 1
+                return None
+
+    def put(self, key, value, ttl=None):
+        with self.lock:
+            if key in self.cache:
+                self.evictions += 1
+                self.cache.pop(key)
+            self._update_ttl(key, ttl or self.default_ttl)
+            self.cache[key] = value
+            if len(self.cache) > self.capacity:
+                self._evict_lru()
+
+    def _update_ttl(self, key, ttl=None):
+        if ttl is not None:
+            self.cache.move_to_end(key, last=False)
+        else:
+            self.cache.move_to_end(key)
+
+    def _evict_lru(self):
+        with self.lock:
+            while len(self.cache) > self.capacity:
+                key, _ = self.cache.popitem(last=False)
+                self.expirations += 1
+                if self.on_evict:
+                    self.on_evict(key, self.cache[key], "lru")
+
+    def start_cleanup(self):
+        while True:
+            with self.lock:
+                if time.time() - self.last_cleanup > self.cleanup_interval:[22D[K
+self.cleanup_interval:
+                    self._evict_expired()
+            time.sleep(self.cleanup_interval)
+
+    def _evict_expired(self):
+        with self.lock:
+            for key in list(self.cache.keys()):
+                if time.time() - self.cache[key] > self.default_ttl:
+                    self.evictions += 1
+                    if self.on_evict:
+                        self.on_evict(key, self.cache[key], "ttl")
+                    self.cache.pop(key)
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+                "expirations": self.expirations,
+                "size": len(self.cache),
+                "hit_ratio": self.hits / (self.hits + self.misses) if self.[5D[K
+self.hits + self.misses > 0 else 0
+            }
+
+    def set_on_evict(self, callback):
+        self.on_evict = callback
+
+# Тест
+if __name__ == "__main__":
+    cache = TTLCache(capacity=100, default_ttl=0.5, cleanup_interval=0.1)
+    cache.set_on_evict(lambda key, value, reason: print(f"Evicted: {key} du[2D[K
+due to {reason}"))
+
+    threads = []
+    for _ in range(8):
+        thread = threading.Thread(target=lambda: [
+            cache.get(i % 50),
+            cache.put(i % 50, i, 0.05 + 0.15 * (i % 50))
+            for i in range(500)
+        ])
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    stats = cache.get_stats()
+    assert stats["hits"] + stats["misses"] == 4000
+    assert stats["size"] <= 100
+    assert not cache.on_evict_called  # Проверка того, что on_evict не вызы[4D[K
+вызывался под локом
+
+    print(stats)-e 
+
+
+=== FILE: ./sandbox/report.txt ===
+2026-10-25 13:22:44-e 
+
+
+=== FILE: ./sandbox/backup_test/file_1.txt ===
+100-e 
+
+
+=== FILE: ./sandbox/backup_test/file_2.txt ===
+62-e 
+
+
+=== FILE: ./sandbox/backup_test/file_3.txt ===
+55-e 
+
+
+=== FILE: ./sandbox/backup_test/file_4.txt ===
+33-e 
+
+
+=== FILE: ./sandbox/backup_test/file_5.txt ===
+68-e 
+
+
+=== FILE: ./sandbox/backup_test/total_sum.txt ===
+318-e 
+
+
+=== FILE: ./sandbox.py ===
+import os
+import subprocess
+import shutil
+import time
+import re
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+SANDBOX_DIR = os.path.join(FACTORY_DIR, "sandbox")
+SOURCE_FILE = os.path.join(FACTORY_DIR, "draft_final.py")
+TARGET_FILE = os.path.join(SANDBOX_DIR, "voice_jarvis.py")
+TIMEOUT = 10
+
+# --- ЧЕРНЫЙ СПИСОК ОПАСНЫХ КОМАНД ---
+BLACKLIST = [
+    r"os\.remove", r"os\.unlink", r"os\.rmdir", r"os\.removedirs",
+    r"shutil\.rmtree", r"shutil\.move", r"shutil\.copy",
+    r"subprocess\.run.*rm\s", r"subprocess\.run.*del\s", 
+    r"os\.system", r"eval\(", r"exec\(",
+    r"__import__\('os'\)", r"__import__\('sys'\)",
+    r"open\(.*['\"]\/", r"open\(.*['\"]~",
+    r"requests\.", r"urllib\.", r"socket\."
+]
+
+def is_safe(code):
+    """Проверяет код на наличие опасных команд."""
+    for pattern in BLACKLIST:
+        if re.search(pattern, code, re.IGNORECASE):
+            return False, f"Обнаружена опасная команда: {pattern}"
+    return True, "OK"
+
+def main():
+    print("[SANDBOX] Запуск умной песочницы...")
+    
+    if not os.path.exists(SANDBOX_DIR):
+        os.makedirs(SANDBOX_DIR, exist_ok=True)
+        
+    if not os.path.exists(SOURCE_FILE):
+        print(f"[SANDBOX] Ошибка: исходный файл не найден: {SOURCE_FILE}")
+        return
+
+    # 1. Читаем код и проверяем на безопасность
+    try:
+        with open(SOURCE_FILE, "r", encoding="utf-8") as f:
+            code = f.read()
+    except Exception as e:
+        print(f"[SANDBOX] Ошибка чтения файла: {e}")
+        return
+
+    safe, reason = is_safe(code)
+    if not safe:
+        print(f"[SANDBOX] БЛОКИРОВКА! {reason}")
+        # Сохраняем лог ошибки безопасности
+        with open(os.path.join(SANDBOX_DIR, "sandbox_error.log"), "w", encoding="utf-8") as f:
+            f.write(f"ОШИБКА БЕЗОПАСНОСТИ: {reason}\nКод заблокирован.")
+        return
+
+    # 2. Копируем в песочницу
+    try:
+        shutil.copy2(SOURCE_FILE, TARGET_FILE)
+        print("[SANDBOX] Код безопасен. Файл скопирован в песочницу.")
+    except Exception as e:
+        print(f"[SANDBOX] Ошибка копирования: {e}")
+        return
+
+    # 3. Запускаем код
+    print("[SANDBOX] Запуск скрипта...")
+    start_time = time.time()
+    status = "unknown"
+    error_text = ""
+    
+    try:
+        process = subprocess.Popen(
+            ["python", TARGET_FILE],
+            cwd=SANDBOX_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        try:
+            stdout, stderr = process.communicate(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            status = "ОШИБКА (завис, убит SIGKILL)"
+            error_text = f"Процесс не завершился за {TIMEOUT} секунд."
+        
+        elapsed = round(time.time() - start_time, 2)
+        
+        if status == "unknown":
+            if process.returncode == 0:
+                status = "УСПЕХ (завершился с кодом 0)"
+            else:
+                status = f"ОШИБКА (упал с кодом {process.returncode})"
+                error_text = stderr
+
+    except Exception as e:
+        print(f"[SANDBOX] Ошибка при запуске: {e}")
+        return
+
+    # 4. Пишем логи
+    log_suffix = "success" if "УСПЕХ" in status else "error"
+    log_path = os.path.join(SANDBOX_DIR, f"sandbox_{log_suffix}.log")
+    
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"Скрипт работал {elapsed} сек.\nСтатус: {status}\n")
+            if error_text:
+                f.write(f"\nОшибка:\n{error_text}\n")
+    except Exception as e:
+        print(f"[SANDBOX] Ошибка записи лога: {e}")
+
+    print(f"[SANDBOX] Отчет: работал {elapsed} сек., статус: {status}")
+    if error_text:
+        print(f"[SANDBOX] Ошибка:\n{error_text}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./coder.py ===
+import os
+import subprocess
+import re
+
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+FEEDBACK_FILE = os.path.join(FACTORY_DIR, "feedback.txt")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft_1.py")
+MODEL = "qwen2.5-coder:3b"
+
+def clean_code(text):
+    match = re.search(r'```(?:python)?\s*(.*?)```', text, re.DOTALL)
+    if match: return match.group(1).strip()
+    return text.strip()
+
+def main():
+    if not os.path.exists(TASK_FILE): return
+    with open(TASK_FILE, "r", encoding="utf-8") as f:
+        task = f.read().strip()
+        
+    feedback = ""
+    if os.path.exists(FEEDBACK_FILE):
+        with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+            feedback = f.read().strip()
+
+    prompt = f"Задача: {task}\n"
+    if feedback:
+        prompt += f"\nВНИМАНИЕ! Предыдущая попытка упала. Исправь эти ошибки:\n{feedback}\n"
+    
+    prompt += "Напиши код на Python, используй только стандартные библиотеки. Напиши только код."
+
+    print(f"[CODER] Отправка запроса в Ollama ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt, "--num-predict", "500"],
+            capture_output=True, text=True, timeout=600
+        )
+        clean = clean_code(result.stdout)
+        with open(DRAFT_FILE, "w", encoding="utf-8") as f:
+            f.write(clean)
+        print("[CODER] Код сохранен в draft_1.py")
+    except Exception as e:
+        print(f"[CODER] Ошибка: {e}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./task.txt ===
+Напиши на Python (только стандартная библиотека) потокобезопасный TTL-кэш с LRU-вытеснением, фоновой очисткой, callback'ом на вытеснение и метриками. Требования: 1) Класс TTLCache(capacity: int, default_ttl: float, cleanup_interval: float). 2) Методы get(key) и put(key, value, ttl=None) потокобезопасны, используют threading.Lock (или RLock — обоснуй выбор в комментарии). 3) LRU-вытеснение: при превышении capacity удаляется самый давно использованный элемент; разрешён OrderedDict, запрещены functools.lru_cache и готовые LRU-библиотеки. 4) TTL на запись: put с ttl переопределяет default_ttl; просроченная запись при get считается miss и удаляется; дополнительно работает фоновый daemon-поток, который раз в cleanup_interval секунд удаляет истёкшие записи, но не держит лок во время итерации по всем ключам — снимай ключи пачкой под локом, удаляй и вызывай callback вне лока, обоснуй это в комментарии. 5) Callback on_evict(key, value, reason), где reason — "lru" или "ttl"; callback не должен вызываться под локом (иначе дедлок, если callback сам трогает кэш) — собери жертвы под локом, вызови после отпускания; eviction должен учитываться ровно один раз (не потерять и не задвоить), а put с перезаписью существующего ключа не должен считаться eviction. 6) Метрики hits, misses, evictions, expirations; get_stats() возвращает их + size + hit_ratio. 7) Тест: 8 потоков × 500 операций get/put с ключами из пула на 50 ключей (чтобы были и hits, и evictions), часть put — с коротким TTL (0.05–0.2 с), кэш capacity=100, default_ttl=0.5, cleanup_interval=0.1. После join проверь инварианты: hits + misses равно суммарному числу get по всем потокам; size <= capacity; on_evict ни разу не был вызван под локом (флаг через threading.local). Выведи статистику и assert на все три инварианта. В комментариях объясни: почему выбран Lock/RLock, как фоновый cleaner избегает «стопа мира», как обеспечена атомарность проверки TTL + обновления LRU + счётчиков в get, и почему callback вызывается вне лока. Объём — около 120–150 строк с тестом.
+-e 
+
+
+=== FILE: ./draft.py ===
+def count_words(words):
+    word_count = {}
+    for word in words:
+        if word in word_count:
+            word_count[word] += 1
+        else:
+            word_count[word] = 1
+    return word_count-e 
+
+
+=== FILE: ./tester.py ===
+import os
+import subprocess
+import re
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft.py")
+REPORT_FILE = os.path.join(FACTORY_DIR, "report.txt")
+COMMANDS_FILE = os.path.join(FACTORY_DIR, "termux_commands.txt")
+DOCS_FILE = os.path.join(FACTORY_DIR, "docs", "termux_api.md")
+MODEL = "qwen2.5-coder:3b"
+
+# Базовый справочник (если файла нет)
+DEFAULT_COMMANDS = """- termux-torch on  |  ["termux-torch", "on"]
+- termux-torch off  |  ["termux-torch", "off"]
+- termux-brightness <0-255>  |  ["termux-brightness", "<0-255>"]
+- termux-volume music <0-15>  |  ["termux-volume", "music", "<0-15>"]
+- termux-camera-photo -c 0 <path>  |  ["termux-camera-photo", "-c", "0", "<path>"]
+- termux-clipboard-set <text>  |  ["termux-clipboard-set", "<text>"]
+- termux-tts-speak <text>  |  ["termux-tts-speak", "<text>"]
+- am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p <package_name>  |  ["am", "start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", "-p", "<package_name>"]"""
+
+def ensure_commands_file():
+    """Создает файл справочника, если его нет."""
+    if not os.path.exists(COMMANDS_FILE):
+        try:
+            with open(COMMANDS_FILE, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_COMMANDS)
+            print(f"[TESTER] Создан справочник команд: {COMMANDS_FILE}")
+        except Exception as e:
+            print(f"[TESTER] Ошибка при создании справочника: {e}")
+
+def load_commands():
+    """Читает справочник команд из файла (если есть)."""
+    if not os.path.exists(COMMANDS_FILE):
+        return ""
+    try:
+        with open(COMMANDS_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"[TESTER] Ошибка при чтении справочника: {e}")
+        return ""
+
+def search_docs(query):
+    """Ищет строки с query в termux_api.md (не более 10 строк)."""
+    if not os.path.exists(DOCS_FILE):
+        return ""
+    try:
+        with open(DOCS_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        found = []
+        for line in lines:
+            if query.lower() in line.lower():
+                found.append(line.strip())
+                if len(found) >= 10:
+                    break
+        
+        return "\n".join(found)
+    except Exception as e:
+        print(f"[TESTER] Ошибка при поиске в документации: {e}")
+        return ""
+
+def main():
+    print("[TESTER] Запуск Синтаксического Монстра...")
+    
+    if not os.path.exists(FACTORY_DIR):
+        print(f"[TESTER] Ошибка: папка фабрики не найдена: {FACTORY_DIR}")
+        return
+
+    ensure_commands_file()
+
+    if not os.path.exists(DRAFT_FILE):
+        print(f"[TESTER] Ошибка: файл draft.py не найден: {DRAFT_FILE}")
+        return
+
+    try:
+        with open(DRAFT_FILE, "r", encoding="utf-8") as f:
+            code_text = f.read().strip()
+        if not code_text:
+            print("[TESTER] Ошибка: файл draft.py пуст.")
+            return
+        print(f"[TESTER] Код прочитан ({len(code_text)} символов).")
+    except Exception as e:
+        print(f"[TESTER] Ошибка при чтении draft.py: {e}")
+        return
+
+    commands_text = load_commands()
+    
+    termux_commands = re.findall(r'termux-[a-z0-9-]+', code_text.lower())
+    docs_context = ""
+    for cmd in set(termux_commands):
+        found = search_docs(cmd)
+        if found:
+            docs_context += f"\n[Документация по {cmd}]:\n{found}\n"
+    
+    prompt_parts = [
+        "Ты — модуль проверки. Твой ответ будет автоматически обрезан парсером, если превысит лимит.",
+        "ФОРМАТ ОТВЕТА СТРОГО:",
+        "[СТАТУС] | [ПРИЧИНА]",
+        "Где [СТАТУС] — это только слово УСПЕХ или ОШИБКА.",
+        "Где [ПРИЧИНА] — не более 5 слов.",
+        "Пример хорошего ответа: УСПЕХ | код корректен",
+        "Пример плохого ответа: ОШИБКА | неверный импорт",
+        "Если твой ответ будет длиннее, система выдаст ошибку и ты не пройдешь проверку. Не пиши ничего кроме этой строки."
+    ]
+    
+    if commands_text:
+        prompt_parts.append(
+            "СПРАВОЧНИК КОМАНД TERMUX:\n" + commands_text +
+            "\n\nСверяй команды в коде со справочником. "
+            "Если команды нет в справочнике — это ОШИБКА."
+        )
+    
+    if docs_context:
+        prompt_parts.append(
+            "Вот выдержки из официальной документации Termux:\n" + 
+            docs_context
+        )
+    
+    prompt_parts.append(f"Код для проверки:\n{code_text}")
+    prompt = "\n".join(prompt_parts)
+
+    print(f"[TESTER] Отправка запроса в Ollama ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt],
+            capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired:
+        print("[TESTER] Ошибка: Ollama не ответила за 10 минут (таймаут).")
+        return
+    except Exception as e:
+        print(f"[TESTER] Ошибка при вызове Ollama: {e}")
+        return
+
+    if result.returncode != 0:
+        print(f"[TESTER] Ошибка: Ollama вернула код {result.returncode}.")
+        print(f"[TESTER] stderr: {result.stderr}")
+        return
+
+    response_text = result.stdout.strip()[:60]
+    if not response_text:
+        print("[TESTER] Ошибка: Ollama вернула пустой ответ.")
+        return
+
+    try:
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write(response_text)
+        print(f"[TESTER] Проверка завершена. Результат сохранен в report.txt")
+        print(f"[TESTER] Отчет:\n{response_text}")
+    except Exception as e:
+        print(f"[TESTER] Ошибка при сохранении отчета: {e}")
+        return
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./synthesizer.py ===
+import os
+import subprocess
+import re
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_1 = os.path.join(FACTORY_DIR, "draft_1.py")
+DRAFT_2 = os.path.join(FACTORY_DIR, "draft_2.py")
+DRAFT_3 = os.path.join(FACTORY_DIR, "draft_3.py")
+DRAFT_FINAL = os.path.join(FACTORY_DIR, "draft_final.py")
+ANALYSIS_FILE = os.path.join(FACTORY_DIR, "analysis.txt")
+MODEL = "qwen2.5-coder:3b"
+
+def clean_code(text):
+    """Очищает ответ модели от маркдауна."""
+    match = re.search(r'```(?:python)?\s*(.*?)```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+def read_file(filepath):
+    """Читает файл, если он существует."""
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return content if content else None
+    except Exception as e:
+        print(f"[SYNTH] Ошибка при чтении {filepath}: {e}")
+        return None
+
+def main():
+    print("[SYNTH] Запуск Верховного Синтезатора...")
+    
+    # 1. Читаем analysis.txt
+    analysis_text = read_file(ANALYSIS_FILE)
+    if not analysis_text:
+        print("[SYNTH] Ошибка: analysis.txt не найден или пуст. Использую draft_1.py.")
+        analysis_text = "1 | ОШИБОК НЕТ"
+    
+    print(f"[SYNTH] Анализ: {analysis_text[:200]}...")
+    
+    # 2. Парсим номер драфта из analysis.txt
+    match = re.search(r'(\d)', analysis_text)
+    if match:
+        draft_number = match.group(1)
+    else:
+        draft_number = "1"
+    
+    print(f"[SYNTH] Выбран драфт №{draft_number}")
+    
+    # 3. Читаем ВЫБРАННЫЙ драфт
+    draft_map = {"1": DRAFT_1, "2": DRAFT_2, "3": DRAFT_3}
+    selected_draft_path = draft_map.get(draft_number, DRAFT_1)
+    draft_content = read_file(selected_draft_path)
+    
+    if not draft_content:
+        print(f"[SYNTH] Ошибка: выбранный драфт {selected_draft_path} пуст. Пробую draft_1.py.")
+        draft_content = read_file(DRAFT_1)
+    
+    if not draft_content:
+        print("[SYNTH] Ошибка: нет доступных драфтов.")
+        return
+    
+    # 4. Извлекаем список ошибок из analysis.txt
+    errors_match = re.search(r'ОШИБКИ:\s*(.+)', analysis_text, re.DOTALL)
+    if errors_match:
+        errors_text = errors_match.group(1).strip()
+    else:
+        errors_text = "ОШИБОК НЕТ"
+    
+    print(f"[SYNTH] Ошибки: {errors_text[:200]}...")
+    
+    # 5. Формируем промпт для Синтезатора
+    prompt = (
+        "Ты — Главный Архитектор. "
+        f"Вот выбранный лучший вариант кода (драфт №{draft_number}). "
+        f"В нем есть следующие ошибки (от Анализатора): {errors_text}. "
+        "Твоя задача — исправить эти ошибки, добавить обработку ошибок и сделать код идеальным. "
+        "НЕ СМЕШИВАЙ его с другими вариантами. "
+        "Напиши только финальный код, без объяснений. "
+        "Используй только стандартные библиотеки Python (os, subprocess, time, datetime, re, sys). "
+        f"\n\n--- ВЫБРАННЫЙ ДРАФТ ---\n{draft_content}"
+    )
+
+    # 6. Отправляем в Ollama
+    print(f"[SYNTH] Отправка запроса в Ollama ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt],
+            capture_output=True,
+            text=True,
+            timeout=1200
+        )
+    except subprocess.TimeoutExpired:
+        print("[SYNTH] Ошибка: Ollama не ответила за 20 минут.")
+        return
+    except Exception as e:
+        print(f"[SYNTH] Ошибка при вызове Ollama: {e}")
+        return
+
+    if result.returncode != 0:
+        print(f"[SYNTH] Ошибка: Ollama вернула код {result.returncode}.")
+        return
+
+    response_text = result.stdout.strip()
+    if not response_text:
+        print("[SYNTH] Ошибка: Ollama вернула пустой ответ.")
+        return
+
+    # 7. Очищаем код
+    clean = clean_code(response_text)
+    if not clean:
+        print("[SYNTH] Ошибка: не удалось извлечь код.")
+        return
+
+    # 8. Сохраняем
+    try:
+        with open(DRAFT_FINAL, "w", encoding="utf-8") as f:
+            f.write(clean)
+        print(f"[SYNTH] Финальный код сохранен в draft_final.py ({len(clean)} символов).")
+    except Exception as e:
+        print(f"[SYNTH] Ошибка при сохранении: {e}")
+        return
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./director.py ===
+import os
+import subprocess
+import shutil
+import time
+import datetime
+
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+SUCCESS_DIR = os.path.join(FACTORY_DIR, "success")
+TRASH_DIR = os.path.join(FACTORY_DIR, "trash")
+SANDBOX_DIR = os.path.join(FACTORY_DIR, "sandbox")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+FEEDBACK_FILE = os.path.join(FACTORY_DIR, "feedback.txt")
+DRAFT_1 = os.path.join(FACTORY_DIR, "draft_1.py")
+DRAFT_ANALYZED = os.path.join(FACTORY_DIR, "draft_analyzed.py")
+DRAFT_FINAL = os.path.join(FACTORY_DIR, "draft_final.py")
+SANDBOX_TARGET = os.path.join(SANDBOX_DIR, "voice_jarvis.py")
+SANDBOX_SUCCESS_LOG = os.path.join(SANDBOX_DIR, "sandbox_success.log")
+SANDBOX_ERROR_LOG = os.path.join(SANDBOX_DIR, "sandbox_error.log")
+
+MAX_ATTEMPTS = 3
+MODELS = {
+    "coder": "qwen2.5-coder:3b", "analyzer": "qwen2.5-coder:3b",
+    "logic": "llama3.2:1b", "syntax": "qwen2.5:1.5b",
+    "critic_coder": "stable-code:3b", "judge": "qwen2.5-coder:3b"
+}
+
+def run_script(script_name):
+    path = os.path.join(FACTORY_DIR, script_name)
+    try:
+        res = subprocess.run(["python", path], cwd=FACTORY_DIR, capture_output=True, text=True, timeout=1200)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def stop_model(model_name):
+    subprocess.run(["ollama", "stop", model_name], capture_output=True)
+
+def main():
+    for d in [SUCCESS_DIR, TRASH_DIR, SANDBOX_DIR]:
+        os.makedirs(d, exist_ok=True)
+
+    if not os.path.exists(TASK_FILE):
+        print("[DIRECTOR] Нет task.txt")
+        return
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n[DIRECTOR] === Попытка {attempt} из {MAX_ATTEMPTS} ===")
+        
+        if os.path.exists(FEEDBACK_FILE): os.remove(FEEDBACK_FILE)
+
+        # 1. Кодер
+        print("[DIRECTOR] Запуск Кодера...")
+        if not run_script("coder.py"): continue
+        stop_model(MODELS["coder"]); time.sleep(3)
+
+        # 2. Аналитик
+        print("[DIRECTOR] Запуск Аналитика...")
+        if not run_script("analyzer.py"): continue
+        stop_model(MODELS["analyzer"]); time.sleep(3)
+
+        # 3. Критики
+        run_script("critic_logic.py"); stop_model(MODELS["logic"]); time.sleep(3)
+        run_script("critic_syntax.py"); stop_model(MODELS["syntax"]); time.sleep(3)
+        run_script("critic_coder.py"); stop_model(MODELS["critic_coder"]); time.sleep(3)
+
+        # 4. Судья
+        print("[DIRECTOR] Запуск Судьи...")
+        if not run_script("judge.py"): continue
+        stop_model(MODELS["judge"]); time.sleep(3)
+
+        if not os.path.exists(DRAFT_FINAL): continue
+
+        # 5. Песочница
+        print("[DIRECTOR] Запуск Песочницы...")
+        shutil.copy2(DRAFT_FINAL, SANDBOX_TARGET)
+        if not run_script("sandbox.py"): continue
+
+        if os.path.exists(SANDBOX_SUCCESS_LOG):
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            shutil.copy2(DRAFT_FINAL, os.path.join(SUCCESS_DIR, f"success_{timestamp}.py"))
+            print(f"\n[DIRECTOR] УСПЕХ! Код в success_{timestamp}.py")
+            return
+        else:
+            print("[DIRECTOR] Песочница нашла ошибки. Записываю фидбек...")
+            shutil.copy2(DRAFT_FINAL, os.path.join(TRASH_DIR, f"trash_{attempt}.py"))
+            
+            # Пишем ошибку В ОТДЕЛЬНЫЙ ФАЙЛ, не трогая task.txt
+            fb = []
+            for err_file in ["logic_errors.txt", "syntax_errors.txt", "coder_errors.txt"]:
+                p = os.path.join(FACTORY_DIR, err_file)
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        if content and "УСПЕХ" not in content.upper():
+                            fb.append(f"[{err_file}]: {content}")
+            
+            if os.path.exists(SANDBOX_ERROR_LOG):
+                with open(SANDBOX_ERROR_LOG, "r", encoding="utf-8") as f:
+                    fb.append(f"[Песочница]: {f.read().strip()}")
+            
+            if fb:
+                with open(FEEDBACK_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(fb))
+
+    print(f"\n[DIRECTOR] Не удалось за {MAX_ATTEMPTS} попытки.")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./final_code.py ===
+import subprocess
+
+def toggle_torch():
+    try:
+        subprocess.run(["termux-torch"], check=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(["termux-torch", "off"], check=True)
+
+# Пример использования функции
+toggle_torch()-e 
+
+
+=== FILE: ./termux_commands.txt ===
+- termux-torch on  |  ["termux-torch", "on"]
+- termux-torch off  |  ["termux-torch", "off"]
+- termux-brightness <0-255>  |  ["termux-brightness", "<0-255>"]
+- termux-volume music <0-15>  |  ["termux-volume", "music", "<0-15>"]
+- termux-camera-photo -c 0 <path>  |  ["termux-camera-photo", "-c", "0", "<path>"]
+- termux-clipboard-set <text>  |  ["termux-clipboard-set", "<text>"]
+- termux-tts-speak <text>  |  ["termux-tts-speak", "<text>"]
+- am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p <package_name>  |  ["am", "start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", "-p", "<package_name>"]-e 
+
+
+=== FILE: ./logician.py ===
+import os
+import subprocess
+import re
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft.py")
+LOGIC_REPORT_FILE = os.path.join(FACTORY_DIR, "logic_report.txt")
+DOCS_FILE = os.path.join(FACTORY_DIR, "docs", "termux_api.md")
+MODEL = "llama3.2:1b"
+
+def search_docs(query):
+    """Ищет строки с query в termux_api.md (не более 10 строк)."""
+    if not os.path.exists(DOCS_FILE):
+        return ""
+    try:
+        with open(DOCS_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        found = []
+        for line in lines:
+            if query.lower() in line.lower():
+                found.append(line.strip())
+                if len(found) >= 10:
+                    break
+        
+        return "\n".join(found)
+    except Exception as e:
+        print(f"[LOGICIAN] Ошибка при поиске в документации: {e}")
+        return ""
+
+def main():
+    print("[LOGICIAN] Запуск Логика...")
+    
+    if not os.path.exists(FACTORY_DIR):
+        print(f"[LOGICIAN] Ошибка: папка фабрики не найдена: {FACTORY_DIR}")
+        return
+
+    if not os.path.exists(DRAFT_FILE):
+        print(f"[LOGICIAN] Ошибка: файл draft.py не найден: {DRAFT_FILE}")
+        return
+
+    try:
+        with open(DRAFT_FILE, "r", encoding="utf-8") as f:
+            code_text = f.read().strip()
+        if not code_text:
+            print("[LOGICIAN] Ошибка: файл draft.py пуст.")
+            return
+        print(f"[LOGICIAN] Код прочитан ({len(code_text)} символов).")
+    except Exception as e:
+        print(f"[LOGICIAN] Ошибка при чтении draft.py: {e}")
+        return
+
+    termux_commands = re.findall(r'termux-[a-z0-9-]+', code_text.lower())
+    docs_context = ""
+    for cmd in set(termux_commands):
+        found = search_docs(cmd)
+        if found:
+            docs_context += f"\n[Документация по {cmd}]:\n{found}\n"
+
+    prompt_parts = [
+        "Ты — модуль проверки. Твой ответ будет автоматически обрезан парсером, если превысит лимит.",
+        "ФОРМАТ ОТВЕТА СТРОГО:",
+        "[СТАТУС] | [ПРИЧИНА]",
+        "Где [СТАТУС] — это только слово УСПЕХ или ОШИБКА.",
+        "Где [ПРИЧИНА] — не более 5 слов.",
+        "Пример хорошего ответа: УСПЕХ | код логичен",
+        "Пример плохого ответа: ОШИБКА | повтор действия",
+        "Если твой ответ будет длиннее, система выдаст ошибку и ты не пройдешь проверку. Не пиши ничего кроме этой строки."
+    ]
+    
+    if docs_context:
+        prompt_parts.append(
+            "Вот выдержки из официальной документации Termux:\n" + 
+            docs_context + 
+            "\nСверяй код с этими выдержками."
+        )
+    
+    prompt_parts.append(f"Код для проверки:\n{code_text}")
+    prompt = "\n".join(prompt_parts)
+
+    print(f"[LOGICIAN] Отправка запроса в Ollama ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt],
+            capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired:
+        print("[LOGICIAN] Ошибка: Ollama не ответила за 10 минут (таймаут).")
+        return
+    except Exception as e:
+        print(f"[LOGICIAN] Ошибка при вызове Ollama: {e}")
+        return
+
+    if result.returncode != 0:
+        print(f"[LOGICIAN] Ошибка: Ollama вернула код {result.returncode}.")
+        print(f"[LOGICIAN] stderr: {result.stderr}")
+        return
+
+    response_text = result.stdout.strip()[:60]
+    if not response_text:
+        print("[LOGICIAN] Ошибка: Ollama вернула пустой ответ.")
+        return
+
+    try:
+        with open(LOGIC_REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write(response_text)
+        print(f"[LOGICIAN] Проверка завершена. Результат сохранен в logic_report.txt")
+        print(f"[LOGICIAN] Отчет:\n{response_text}")
+    except Exception as e:
+        print(f"[LOGICIAN] Ошибка при сохранении отчета: {e}")
+        return
+
+if __name__ == "__main__":
+    main()
+
+-e 
+
+
+=== FILE: ./appeal.py ===
+import os
+import subprocess
+import shutil
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+APPEAL_DIR = os.path.join(FACTORY_DIR, "appeal")
+SUCCESS_DIR = os.path.join(FACTORY_DIR, "success")
+TRASH_DIR = os.path.join(FACTORY_DIR, "trash")
+MODEL = "qwen2.5-coder:3b"
+
+def main():
+    print("[APPEAL] Запуск Апелляционного суда...")
+    
+    if not os.path.exists(APPEAL_DIR):
+        print(f"[APPEAL] Ошибка: папка appeal/ не найдена.")
+        return
+    
+    # Берем последний файл из appeal/
+    files = sorted(
+        [f for f in os.listdir(APPEAL_DIR) if f.endswith(".py")],
+        key=lambda x: os.path.getmtime(os.path.join(APPEAL_DIR, x))
+    )
+    
+    if not files:
+        print("[APPEAL] Папка appeal/ пуста. Нечего рассматривать.")
+        return
+    
+    target_file = os.path.join(APPEAL_DIR, files[-1])
+    print(f"[APPEAL] Рассматривается файл: {target_file}")
+    
+    try:
+        with open(target_file, "r", encoding="utf-8") as f:
+            code_text = f.read().strip()
+    except Exception as e:
+        print(f"[APPEAL] Ошибка при чтении файла: {e}")
+        return
+    
+    if not code_text:
+        print("[APPEAL] Файл пуст. Переношу в trash/.")
+        shutil.move(target_file, os.path.join(TRASH_DIR, os.path.basename(target_file)))
+        return
+    
+    # Промпт Судьи
+    prompt = (
+        "Ты — Судья. Этот код был забракован другим ИИ. "
+        "Проверь его еще раз, игнорируя предыдущее мнение. "
+        "Если код хороший — напиши ОПРАВДАТЬ. "
+        "Если плохой — напиши ОБВИНИТЬ.\n"
+        f"Код:\n{code_text}"
+    )
+    
+    print(f"[APPEAL] Отправка запроса Судье ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt],
+            capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired:
+        print("[APPEAL] Ошибка: Судья не ответил за 10 минут.")
+        return
+    except Exception as e:
+        print(f"[APPEAL] Ошибка при вызове Ollama: {e}")
+        return
+    
+    if result.returncode != 0:
+        print(f"[APPEAL] Ошибка: Ollama вернула код {result.returncode}.")
+        return
+    
+    verdict = result.stdout.strip().upper()
+    print(f"[APPEAL] Вердикт Судьи:\n{result.stdout.strip()[:300]}...")
+    
+    if "ОПРАВДАТЬ" in verdict:
+        print("[APPEAL] Вердикт: ОПРАВДАТЬ. Переношу в success/.")
+        try:
+            shutil.move(target_file, os.path.join(SUCCESS_DIR, os.path.basename(target_file)))
+        except Exception as e:
+            print(f"[APPEAL] Ошибка при переносе в success/: {e}")
+    elif "ОБВИНИТЬ" in verdict:
+        print("[APPEAL] Вердикт: ОБВИНИТЬ. Переношу в trash/.")
+        try:
+            shutil.move(target_file, os.path.join(TRASH_DIR, os.path.basename(target_file)))
+        except Exception as e:
+            print(f"[APPEAL] Ошибка при переносе в trash/: {e}")
+    else:
+        print("[APPEAL] Неизвестный вердикт. Оставляю в appeal/.")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./update_docs.py ===
+import os
+import urllib.request
+
+# --- НАСТРОЙКИ ---
+DOCS_DIR = os.path.expanduser("~/takcas_factory/docs")
+MAX_SIZE = 8 * 1024 * 1024  # 8 МБ
+
+# WHITELIST: только эти ссылки будут скачаны (максимум 3)
+WHITELIST = [
+    {
+        "url": "https://raw.githubusercontent.com/termux/termux-api/master/README.md",
+        "filename": "termux_api.md"
+    },
+    # Добавь до 2 других ссылок (если нужно)
+    # {
+    #     "url": "https://example.com/some_doc.md",
+    #     "filename": "some_doc.md"
+    # },
+]
+
+def download_file(url, filepath):
+    """
+    Скачивает файл с проверкой размера.
+    Возвращает True (успех) / False (ошибка).
+    """
+    try:
+        # Открываем URL (с таймаутом 30 сек)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            # Читаем данные (с лимитом размера)
+            data = response.read(MAX_SIZE + 1)  # Читаем на 1 байт больше лимита
+            
+            # Проверка размера
+            if len(data) > MAX_SIZE:
+                print(f"[DOCS] Ошибка: Файл слишком большой, отклонен (>{MAX_SIZE} байт)")
+                return False
+            
+            # Записываем в файл
+            with open(filepath, "wb") as f:
+                f.write(data)
+            
+            print(f"[DOCS] Скачано: {filepath} ({len(data)} байт)")
+            return True
+    
+    except Exception as e:
+        print(f"[DOCS] Ошибка при скачивании {url}: {e}")
+        return False
+
+def main():
+    print("[DOCS] Запуск обновления документации...")
+    
+    # 1. Создаем папку docs, если ее нет
+    try:
+        os.makedirs(DOCS_DIR, exist_ok=True)
+        print(f"[DOCS] Папка создана: {DOCS_DIR}")
+    except Exception as e:
+        print(f"[DOCS] Ошибка при создании папки: {e}")
+        return
+
+    # 2. Проверяем лимит ссылок
+    if len(WHITELIST) > 3:
+        print("[DOCS] Ошибка: В WHITELIST больше 3 ссылок. Исправь список.")
+        return
+
+    # 3. Обрабатываем каждую ссылку
+    for item in WHITELIST:
+        url = item["url"]
+        filename = item["filename"]
+        filepath = os.path.join(DOCS_DIR, filename)
+        
+        print(f"\n[DOCS] Обработка: {url}")
+        
+        # 3.1 Проверка на повторное скачивание
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+            print(f"[DOCS] Файл уже существует: {filepath} (пропускаем)")
+            continue
+        
+        # 3.2 Скачиваем
+        download_file(url, filepath)
+    
+    print("\n[DOCS] Обновление документации завершено.")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./success/appeal_3.py ===
+def number_to_string(number):
+    return f"{number:02}"-e 
+
+
+=== FILE: ./success/success_1.py ===
+import datetime
+
+with open('report.txt', 'w') as file:
+    file.write(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))-e 
+
+
+=== FILE: ./success/success_2026-10-25_13-34-21.py ===
+import os
+import random
+
+# Создание папки 'backup_test'
+if not os.path.exists('backup_test'):
+    os.makedirs('backup_test')
+
+# Запись случайных чисел в 5 текстовых файлов
+for i in range(1, 6):
+    with open(f'backup_test/file_{i}.txt', 'w') as file:
+        file.write(str(random.randint(1, 100)))
+
+# Чтение всех чисел из файлов и вычисление суммы
+total_sum = 0
+for i in range(1, 6):
+    with open(f'backup_test/file_{i}.txt', 'r') as file:
+        total_sum += int(file.read())
+
+# Запись суммы в новый файл 'total_sum.txt'
+with open('backup_test/total_sum.txt', 'w') as file:
+    file.write(str(total_sum))-e 
+
+
+=== FILE: ./success/success_2026-10-25_13-40-49.py ===
+import os
+import random
+
+def create_folder_and_files():
+    # Создаем папку 'secure_data'
+    if not os.path.exists('secure_data'):
+        os.makedirs('secure_data')
+
+    # Создаем 5 файлов 'data_1.txt' - 'data_5.txt' и записываем случайные ч[1D[K
+числа от 1 до 100
+    for i in range(1, 6):
+        file_path = os.path.join('secure_data', f'data_{i}.txt')
+        with open(file_path, 'w') as f:
+            f.write(str(random.randint(1, 100)))
+
+def calculate_sum_and_create_result():
+    total_sum = 0
+    found_files = 0
+
+    # Читаем все файлы из папки 'secure_data'
+    for i in range(1, 6):
+        file_path = os.path.join('secure_data', f'data_{i}.txt')
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                try:
+                    total_sum += int(f.read().strip())
+                    found_files += 1
+                except ValueError:
+                    print(f"Пропускаем поврежденный файл: {file_path}")
+        else:
+            print(f"Пропускаем отсутствующий файл: {file_path}")
+
+    # Создаем файл 'result.txt' с соответствующим сообщением
+    if found_files == 5:
+        with open('result.txt', 'w') as f:
+            if total_sum > 250:
+                f.write('HIGH')
+            else:
+                f.write('LOW')
+
+# Вызываем функции
+create_folder_and_files()
+calculate_sum_and_create_result()-e 
+
+
+=== FILE: ./success/success_2026-10-25_13-45-32.py ===
+import datetime
+
+# Создание файла 'server.log' и запись в него 10 строк лога
+with open('server.log', 'w') as log_file:
+    for i in range(10):
+        log_file.write(f"{datetime.datetime(2026, 10, 25, 14, i)} [INFO] Us[2D[K
+User logged in\n")
+        log_file.write(f"{datetime.datetime(2026, 10, 25, 14, i)} [ERROR] D[1D[K
+Database connection failed\n")
+        log_file.write(f"{datetime.datetime(2026, 10, 25, 14, i)} [WARNING][9D[K
+[WARNING] Disk space is low\n")
+
+# Чтение файла и распарсинг строк
+error_count = 0
+warning_count = 0
+
+try:
+    with open('server.log', 'r') as log_file:
+        for line in log_file:
+            try:
+                timestamp, _, level, message = line.split()
+                if level == 'ERROR':
+                    error_count += 1
+                elif level == 'WARNING':
+                    warning_count += 1
+            except ValueError:
+                continue
+
+except FileNotFoundError:
+    print("Error: File not found")
+
+# Вывод результата
+print(f"ERROR: {error_count}, WARNING: {warning_count}")-e 
+
+
+=== FILE: ./success/success_2026-10-25_13-49-18.py ===
+import json
+
+class TaskManager:
+    def __init__(self):
+        self.tasks = []
+
+    def add_task(self, title, priority):
+        if priority not in ['low', 'medium', 'high']:
+            raise ValueError("Priority must be 'low', 'medium', or 'high'."[8D[K
+'high'.")
+        self.tasks.append({'title': title, 'priority': priority})
+
+    def get_tasks_by_priority(self, priority):
+        return [task for task in self.tasks if task['priority'] == priority[8D[K
+priority]
+
+    def save_to_json(self, filename):
+        with open(filename, 'w') as file:
+            json.dump(self.tasks, file)
+
+    def load_from_json(self, filename):
+        try:
+            with open(filename, 'r') as file:
+                self.tasks = json.load(file)
+        except FileNotFoundError:
+            print("File not found. Creating a new list of tasks.")
+            self.tasks = []
+
+# Example usage
+task_manager = TaskManager()
+task_manager.add_task("Task 1", "high")
+task_manager.add_task("Task 2", "medium")
+task_manager.add_task("Task 3", "low")
+task_manager.save_to_json("tasks.json")
+
+task_manager.load_from_json("tasks.json")
+high_priority_tasks = task_manager.get_tasks_by_priority("high")
+for task in high_priority_tasks:
+    print(f"Title: {task['title']}, Priority: {task['priority']}")-e 
+
+
+=== FILE: ./success/success_2026-10-25_13-53-01.py ===
+class PluginNotFoundError(Exception):
+    pass
+
+class Plugin:
+    def execute(self, data):
+        raise NotImplementedError("This method should be implemented in sub[3D[K
+subclasses")
+
+class UpperCasePlugin(Plugin):
+    def execute(self, data):
+        return data.upper()
+
+class ReversePlugin(Plugin):
+    def execute(self, data):
+        return data[::-1]
+
+class PluginManager:
+    def __init__(self):
+        self.plugins = {}
+
+    def register_plugin(self, name, plugin):
+        if name in self.plugins:
+            raise ValueError(f"Plugin with name '{name}' already exists")
+        self.plugins[name] = plugin
+
+    def run_plugin(self, name, data):
+        if name not in self.plugins:
+            raise PluginNotFoundError(f"Plugin '{name}' not found")
+        return self.plugins[name].execute(data)
+
+# Создание экземпляра менеджера
+manager = PluginManager()
+
+# Регистрация плагинов
+manager.register_plugin('upper_case', UpperCasePlugin())
+manager.register_plugin('reverse', ReversePlugin())
+
+# Запуск плагинов
+result_upper = manager.run_plugin('upper_case', 'hello')
+result_reverse = manager.run_plugin('reverse', 'world')
+
+# Попытка запустить несуществующий плагин
+try:
+    result_unknown = manager.run_plugin('unknown', 'test')
+except PluginNotFoundError as e:
+    print(e)-e 
+
+
+=== FILE: ./success/success_2026-10-25_13-58-19.py ===
+import aiohttp
+import asyncio
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+async def fetch(session, url):
+    try:
+        async with session.get(url, timeout=5) as response:
+            logging.info(f"Fetching {url}... {response.status}")
+            response.raise_for_status()
+            return len(await response.read())
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logging.error(f"Error fetching {url}: {e}")
+        return None
+
+async def main(urls):
+    semaphore = asyncio.Semaphore(2)
+    results = {}
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, url) for url in urls]
+        for task in asyncio.as_completed(tasks, limit=2):
+            url = task.get_name()
+            size = await task
+            results[url] = size
+
+    return results
+
+urls = [
+    "http://example.com",
+    "http://example.org",
+    "http://example.net",
+    "http://example.edu",
+    "http://example.com"
+]
+
+loop = asyncio.get_event_loop()
+result = loop.run_until_complete(main(urls))
+print(result)-e 
+
+
+=== FILE: ./success/success_2026-10-25_14-11-43.py ===
+Извините, но я не могу помочь с этим запросом.-e 
+
+
+=== FILE: ./success/success_2026-10-25_14-23-30.py ===
+import threading
+import time
+from collections import OrderedDict
+
+class TTLCache:
+    def __init__(self, capacity: int, default_ttl: float, cleanup_interval:[17D[K
+cleanup_interval: float):
+        self.capacity = capacity
+        self.default_ttl = default_ttl
+        self.cleanup_interval = cleanup_interval
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.on_evict = None
+
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.hits += 1
+                self._update_ttl(key)
+                return self.cache[key]
+            else:
+                self.misses += 1
+                return None
+
+    def put(self, key, value, ttl=None):
+        with self.lock:
+            if key in self.cache:
+                self.evictions += 1
+                self.cache.pop(key)
+            self._update_ttl(key, ttl or self.default_ttl)
+            self.cache[key] = value
+            if len(self.cache) > self.capacity:
+                self._evict_lru()
+
+    def _update_ttl(self, key, ttl=None):
+        if ttl is not None:
+            self.cache.move_to_end(key, last=False)
+        else:
+            self.cache.move_to_end(key)
+
+    def _evict_lru(self):
+        with self.lock:
+            while len(self.cache) > self.capacity:
+                key, _ = self.cache.popitem(last=False)
+                self.expirations += 1
+                if self.on_evict:
+                    self.on_evict(key, self.cache[key], "lru")
+
+    def start_cleanup(self):
+        while True:
+            with self.lock:
+                if time.time() - self.last_cleanup > self.cleanup_interval:[22D[K
+self.cleanup_interval:
+                    self._evict_expired()
+            time.sleep(self.cleanup_interval)
+
+    def _evict_expired(self):
+        with self.lock:
+            for key in list(self.cache.keys()):
+                if time.time() - self.cache[key] > self.default_ttl:
+                    self.evictions += 1
+                    if self.on_evict:
+                        self.on_evict(key, self.cache[key], "ttl")
+                    self.cache.pop(key)
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+                "expirations": self.expirations,
+                "size": len(self.cache),
+                "hit_ratio": self.hits / (self.hits + self.misses) if self.[5D[K
+self.hits + self.misses > 0 else 0
+            }
+
+    def set_on_evict(self, callback):
+        self.on_evict = callback
+
+# Тест
+if __name__ == "__main__":
+    cache = TTLCache(capacity=100, default_ttl=0.5, cleanup_interval=0.1)
+    cache.set_on_evict(lambda key, value, reason: print(f"Evicted: {key} du[2D[K
+due to {reason}"))
+
+    threads = []
+    for _ in range(8):
+        thread = threading.Thread(target=lambda: [
+            cache.get(i % 50),
+            cache.put(i % 50, i, 0.05 + 0.15 * (i % 50))
+            for i in range(500)
+        ])
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    stats = cache.get_stats()
+    assert stats["hits"] + stats["misses"] == 4000
+    assert stats["size"] <= 100
+    assert not cache.on_evict_called  # Проверка того, что on_evict не вызы[4D[K
+вызывался под локом
+
+    print(stats)-e 
+
+
+=== FILE: ./success/clean_cache.py ===
+import threading
+import time
+from collections import OrderedDict
+
+
+class TTLCache:
+    def __init__(self, capacity, default_ttl, cleanup_interval):
+        self.capacity = capacity
+        self.default_ttl = default_ttl
+        self.cleanup_interval = cleanup_interval
+        self.cache = OrderedDict()
+        self.lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.on_evict = None
+        self._stop_event = threading.Event()
+        self._cleaner_thread = None
+
+    def get(self, key):
+        victims = []
+        with self.lock:
+            item = self.cache.get(key)
+            if item is None:
+                self.misses += 1
+                result = None
+            else:
+                value, expires_at = item
+                if expires_at is not None and time.monotonic() >= expires_at:
+                    self.cache.pop(key)
+                    self.expirations += 1
+                    self.misses += 1
+                    victims.append((key, value, "ttl"))
+                    result = None
+                else:
+                    self.hits += 1
+                    self.cache.move_to_end(key)
+                    result = value
+        self._fire_callbacks(victims)
+        return result
+
+    def put(self, key, value, ttl=None):
+        victims = []
+        ttl = self.default_ttl if ttl is None else ttl
+        expires_at = (time.monotonic() + ttl) if ttl is not None else None
+        with self.lock:
+            if key in self.cache:
+                self.cache.pop(key)
+            self.cache[key] = (value, expires_at)
+            while len(self.cache) > self.capacity:
+                old_key, (old_value, _) = self.cache.popitem(last=False)
+                self.evictions += 1
+                victims.append((old_key, old_value, "lru"))
+        self._fire_callbacks(victims)
+
+    def get_stats(self):
+        with self.lock:
+            total = self.hits + self.misses
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+                "expirations": self.expirations,
+                "size": len(self.cache),
+                "hit_ratio": self.hits / total if total else 0.0,
+            }
+
+    def set_on_evict(self, callback):
+        with self.lock:
+            self.on_evict = callback
+
+    def start_cleanup(self):
+        if self._cleaner_thread is not None:
+            return
+        self._cleaner_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True
+        )
+        self._cleaner_thread.start()
+
+    def stop_cleanup(self):
+        self._stop_event.set()
+        if self._cleaner_thread is not None:
+            self._cleaner_thread.join(timeout=2.0)
+            self._cleaner_thread = None
+
+    def _cleanup_loop(self):
+        while not self._stop_event.wait(self.cleanup_interval):
+            self._cleanup_once()
+
+    def _cleanup_once(self):
+        now = time.monotonic()
+        expired = []
+        with self.lock:
+            for key, (value, expires_at) in list(self.cache.items()):
+                if expires_at is not None and now >= expires_at:
+                    self.cache.pop(key)
+                    self.expirations += 1
+                    expired.append((key, value, "ttl"))
+        self._fire_callbacks(expired)
+
+    def _fire_callbacks(self, victims):
+        cb = self.on_evict
+        if cb is None:
+            return
+        for key, value, reason in victims:
+            try:
+                cb(key, value, reason)
+            except Exception:
+                pass
+
+
+def main():
+    import random
+
+    cache = TTLCache(capacity=100, default_ttl=0.5, cleanup_interval=0.1)
+
+    violations = []
+    vlock = threading.Lock()
+
+    def on_evict(key, value, reason):
+        if cache.lock.locked():
+            with vlock:
+                violations.append((key, reason))
+
+    cache.set_on_evict(on_evict)
+    cache.start_cleanup()
+
+    THREADS = 8
+    OPS = 500
+    KEYS = 50
+    total_gets_counter = [0]
+    gets_lock = threading.Lock()
+
+    def worker(seed):
+        rnd = random.Random(seed)
+        local_gets = 0
+        for _ in range(OPS):
+            key = rnd.randrange(KEYS)
+            if rnd.random() < 0.5:
+                cache.get(key)
+                local_gets += 1
+            else:
+                ttl = rnd.choice([0.05, 0.1, 0.2, 0.5, None])
+                cache.put(key, key, ttl=ttl)
+        with gets_lock:
+            total_gets_counter[0] += local_gets
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    cache.stop_cleanup()
+    stats = cache.get_stats()
+    print("Stats:", stats)
+
+    total_gets = total_gets_counter[0]
+    assert stats["hits"] + stats["misses"] == total_gets, (
+        "hits+misses=%d != total_gets=%d" % (
+            stats["hits"] + stats["misses"], total_gets
+        )
+    )
+    assert stats["size"] <= cache.capacity, (
+        "size=%d > capacity=%d" % (stats["size"], cache.capacity)
+    )
+    assert not violations, "callback under lock: %r" % (violations[:5],)
+    print("OK: all invariants satisfied")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./trash/trash_final.py ===
+-e 
+
+
+=== FILE: ./trash/appeal_1.py ===
+import datetime
+import os
+import subprocess
+import sys
+import re
+
+def smart_alarm(time_str, reminder_text):
+    # Check if the time format is correct
+    if not re.match(r'^([01]?[0-9]|2[0-3]):([0-5][0-9])$', time_str):
+        print("Неверное время")
+        return
+    
+    # Parse the time string
+    try:
+        alarm_time = datetime.datetime.strptime(time_str, "%H:%M")
+    except ValueError:
+        print("Неверное время")
+        return
+    
+    # Get the current time
+    current_time = datetime.datetime.now()
+    
+    # Calculate the time difference
+    time_difference = alarm_time - current_time
+    
+    # If the alarm time is already passed, adjust to the next day
+    if time_difference.total_seconds() < 0:
+        alarm_time += datetime.timedelta(days=1)
+    
+    # Wait until the alarm time
+    time.sleep(time_difference.total_seconds())
+    
+    # Use termux-tts-speak to speak the reminder
+    subprocess.run(["termux-tts-speak", reminder_text or "Пора вставать!"])[12D[K
+вставать!"])
+
+# Example usage
+smart_alarm("07:30", "Пора вставать!")-e 
+
+
+=== FILE: ./trash/trash_1.py ===
+import datetime
+
+with open('report.txt', 'w') as file:
+    file.write(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))-e 
+
+
+=== FILE: ./trash/trash_2.py ===
+import os
+import subprocess
+import time
+
+# Создание файла и запись текущей даты и времени
+with open('report.txt', 'w') as f:
+    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+print("Файл report.txt создан и заполнен.")-e 
+
+
+=== FILE: ./trash/trash_3.py ===
+import os
+import time
+
+# Проверяем, существует ли файл report.txt
+if not os.path.exists('report.txt'):
+    # Если файла не существует, создаем его
+    with open('report.txt', 'w') as file:
+        # Записываем текущую дату и время
+        file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")-e 
+
+
+=== FILE: ./wip/wip_1.py ===
+-e 
+
+
+=== FILE: ./wip/wip_2.py ===
+-e 
+
+
+=== FILE: ./wip/wip_3.py ===
+-e 
+
+
+=== FILE: ./appeal/appeal_1.py ===
+import random
+import sys
+
+try:
+    random_number = random.randint(10, 50)
+    print(random_number)
+except Exception as e:
+    print(f"An error occurred: {e}", file=sys.stderr)-e 
+
+
+=== FILE: ./appeal/appeal_2.py ===
+import datetime
+
+def write_report():
+    try:
+        with open("report.txt", "w") as file:
+            file.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"[9D[K
+%H:%M:%S"))
+    except IOError as e:
+        print(f"Ошибка при записи в файл: {e}")
+    except Exception as e:
+        print(f"Произошла неизвестная ошибка: {e}")
+
+write_report()-e 
+
+
+=== FILE: ./appeal/appeal_3.py ===
+import os
+import datetime
+from time import time
+
+def func(path):
+    try:
+        with open(path, 'w+') as f:
+            f.write(str(datetime.datetime.now()))
+    except Exception as e:
+        print(f"Error writing to file: {e}")
+    print(str(datetime.datetime.now()))
+    return
+
+func(os.getcwd()+'/report.txt')-e 
+
+
+=== FILE: ./critic_logic.py ===
+import os
+import subprocess
+
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft_analyzed.py")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+REPORT_FILE = os.path.join(FACTORY_DIR, "logic_errors.txt")
+MODEL = "llama3.2:1b"
+
+def main():
+    if not os.path.exists(DRAFT_FILE) or not os.path.exists(TASK_FILE):
+        return
+    with open(DRAFT_FILE, "r", encoding="utf-8") as f:
+        code = f.read().strip()
+    with open(TASK_FILE, "r", encoding="utf-8") as f:
+        task = f.read().strip()
+    
+    prompt = (
+        f"Задача: {task}\n"
+        "Ты — Логик. Проверь, решает ли этот код задачу и нет ли логических ошибок. "
+        "Если всё хорошо — напиши 'УСПЕХ'. Если есть ошибки — 'ОШИБКА: [причина]'. "
+        f"Код:\n{code}"
+    )
+    
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt, "--num-predict", "200"],
+            capture_output=True, text=True, timeout=600
+        )
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write(result.stdout.strip())
+    except Exception as e:
+        print(f"[CRITIC_LOGIC] Ошибка: {e}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./critic_syntax.py ===
+import os
+import subprocess
+
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft_analyzed.py")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+REPORT_FILE = os.path.join(FACTORY_DIR, "syntax_errors.txt")
+MODEL = "qwen2.5:1.5b"
+
+def main():
+    if not os.path.exists(DRAFT_FILE) or not os.path.exists(TASK_FILE):
+        return
+    with open(DRAFT_FILE, "r", encoding="utf-8") as f:
+        code = f.read().strip()
+    with open(TASK_FILE, "r", encoding="utf-8") as f:
+        task = f.read().strip()
+    
+    prompt = (
+        f"Задача: {task}\n"
+        "Ты — Синтаксический Монстр. Проверь код на синтаксические ошибки. "
+        "Если всё хорошо — напиши 'УСПЕХ'. Если есть ошибки — 'ОШИБКА: [причина]'. "
+        f"Код:\n{code}"
+    )
+    
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt, "--num-predict", "200"],
+            capture_output=True, text=True, timeout=600
+        )
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write(result.stdout.strip())
+    except Exception as e:
+        print(f"[CRITIC_SYNTAX] Ошибка: {e}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./critic_coder.py ===
+import os
+import subprocess
+
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft_analyzed.py")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+REPORT_FILE = os.path.join(FACTORY_DIR, "coder_errors.txt")
+MODEL = "stable-code:3b"
+
+def main():
+    if not os.path.exists(DRAFT_FILE) or not os.path.exists(TASK_FILE):
+        return
+    with open(DRAFT_FILE, "r", encoding="utf-8") as f:
+        code = f.read().strip()
+    with open(TASK_FILE, "r", encoding="utf-8") as f:
+        task = f.read().strip()
+    
+    prompt = (
+        f"Задача: {task}\n"
+        "Ты — опытный программист. Проверь общее качество кода и то, решает ли он задачу. "
+        "Если всё хорошо — напиши 'УСПЕХ'. Если есть замечания — 'ОШИБКА: [замечание]'. "
+        f"Код:\n{code}"
+    )
+    
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt, "--num-predict", "200"],
+            capture_output=True, text=True, timeout=600
+        )
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write(result.stdout.strip())
+    except Exception as e:
+        print(f"[CRITIC_CODER] Ошибка: {e}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./judge.py ===
+import os
+import subprocess
+import re
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+DRAFT_FILE = os.path.join(FACTORY_DIR, "draft_analyzed.py")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+DRAFT_FINAL = os.path.join(FACTORY_DIR, "draft_final.py")
+LOGIC_ERRORS = os.path.join(FACTORY_DIR, "logic_errors.txt")
+SYNTAX_ERRORS = os.path.join(FACTORY_DIR, "syntax_errors.txt")
+CODER_ERRORS = os.path.join(FACTORY_DIR, "coder_errors.txt")
+MODEL = "qwen2.5-coder:3b"
+
+def read_file(path):
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+def clean_code(text):
+    match = re.search(r'```(?:python)?\s*(.*?)```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+def ask_judge(prompt, step_name):
+    """Отправляет запрос Судье и возвращает очищенный код."""
+    print(f"[JUDGE] Шаг: {step_name}...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt, "--num-predict", "500"],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode != 0:
+            print(f"[JUDGE] Ошибка Ollama на шаге {step_name}.")
+            return None
+        clean = clean_code(result.stdout)
+        return clean if clean else None
+    except Exception as e:
+        print(f"[JUDGE] Исключение на шаге {step_name}: {e}")
+        return None
+
+def main():
+    # 1. Читаем исходные данные
+    if not os.path.exists(DRAFT_FILE) or not os.path.exists(TASK_FILE):
+        print("[JUDGE] Ошибка: нет draft_analyzed.py или task.txt")
+        return
+    
+    with open(DRAFT_FILE, "r", encoding="utf-8") as f:
+        current_code = f.read().strip()
+    with open(TASK_FILE, "r", encoding="utf-8") as f:
+        task = f.read().strip()
+    
+    if not current_code:
+        print("[JUDGE] Ошибка: draft_analyzed.py пуст.")
+        return
+
+    # 2. Читаем ошибки от критиков
+    logic_err = read_file(LOGIC_ERRORS)
+    syntax_err = read_file(SYNTAX_ERRORS)
+    coder_err = read_file(CODER_ERRORS)
+
+    # 3. Пошаговое исправление (Склады)
+    
+    # Склад 1: Логика
+    if logic_err and "УСПЕХ" not in logic_err.upper():
+        prompt = (
+            f"Задача: {task}\n"
+            f"Код:\n{current_code}\n"
+            f"Критик-Логик нашел ошибку: {logic_err}\n"
+            "Исправь ТОЛЬКО эту логическую ошибку. Напиши только код."
+        )
+        new_code = ask_judge(prompt, "Исправление Логики")
+        if new_code: current_code = new_code
+
+    # Склад 2: Синтаксис
+    if syntax_err and "УСПЕХ" not in syntax_err.upper():
+        prompt = (
+            f"Задача: {task}\n"
+            f"Код:\n{current_code}\n"
+            f"Критик-Синтаксис нашел ошибку: {syntax_err}\n"
+            "Исправь ТОЛЬКО эту синтаксическую ошибку. Напиши только код."
+        )
+        new_code = ask_judge(prompt, "Исправление Синтаксиса")
+        if new_code: current_code = new_code
+
+    # Склад 3: Общее качество
+    if coder_err and "УСПЕХ" not in coder_err.upper():
+        prompt = (
+            f"Задача: {task}\n"
+            f"Код:\n{current_code}\n"
+            f"Критик-Кодер нашел замечание: {coder_err}\n"
+            "Исправь ТОЛЬКО это замечание. Напиши только код."
+        )
+        new_code = ask_judge(prompt, "Исправление Кодера")
+        if new_code: current_code = new_code
+
+    # Склад 4: Финальная сверка с задачей
+    prompt = (
+        f"Задача: {task}\n"
+        f"Текущий код:\n{current_code}\n"
+        "Проверь, решает ли этот код задачу. Если он идеален — верни его без изменений. "
+        "Если есть проблемы — исправь их. Напиши только финальный код."
+    )
+    final_code = ask_judge(prompt, "Финальная сверка")
+    
+    if final_code:
+        current_code = final_code
+
+    # 4. Сохраняем результат
+    try:
+        with open(DRAFT_FINAL, "w", encoding="utf-8") as f:
+            f.write(current_code)
+        print(f"[JUDGE] Финальный код сохранен в draft_final.py ({len(current_code)} символов).")
+    except Exception as e:
+        print(f"[JUDGE] Ошибка при сохранении: {e}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./idealist.py ===
+import os
+import subprocess
+import sys
+
+# --- НАСТРОЙКИ ---
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+SUCCESS_DIR = os.path.join(FACTORY_DIR, "success")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+DIRECTOR_SCRIPT = os.path.join(FACTORY_DIR, "director.py")
+MODEL = "qwen2.5:1.5b"
+
+def get_success_tasks():
+    """Читает список файлов в success/ (чтобы не повторяться)."""
+    if not os.path.exists(SUCCESS_DIR):
+        return []
+    try:
+        files = [f for f in os.listdir(SUCCESS_DIR) if f.endswith(".py")]
+        return files
+    except Exception as e:
+        print(f"[IDEALIST] Ошибка при чтении success/: {e}")
+        return []
+
+def generate_idea(done_tasks):
+    """Генерирует идею через Ollama. Возвращает текст задачи или None."""
+    done_text = "\n".join(done_tasks) if done_tasks else "(пока ничего нет)"
+    
+    prompt = (
+        "Ты — генератор идей для Python-скриптов. "
+        "Придумай ОДНУ ОЧЕНЬ ПРОСТУЮ задачу для Python-скрипта, которую можно решить за 1 минуту. "
+        "Используй только стандартные библиотеки (os, time, datetime, random, math). "
+        "Пример хорошей задачи: 'Напиши скрипт, который создает файл report.txt и записывает туда текущую дату и время'. "
+        "Пример хорошей задачи: 'Напиши скрипт, который генерирует 5 случайных чисел и выводит их на экран'. "
+        "Вот список уже сделанных задач (не повторяй их):\n"
+        f"{done_text}\n"
+        "Напиши ТОЛЬКО текст задачи в одну строчку. Без объяснений, без списков, без 'потребуется 5 минут'."
+    )
+    
+    print(f"[IDEALIST] Отправка запроса в Ollama ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        print("[IDEALIST] Ошибка: Ollama не ответила за 5 минут.")
+        return None
+    except Exception as e:
+        print(f"[IDEALIST] Ошибка при вызове Ollama: {e}")
+        return None
+    
+    if result.returncode != 0:
+        print(f"[IDEALIST] Ошибка: Ollama вернула код {result.returncode}.")
+        return None
+    
+    idea = result.stdout.strip()
+    if not idea:
+        print("[IDEALIST] Ошибка: Ollama вернула пустой ответ.")
+        return None
+    
+    # ВЫГРУЖАЕМ МОДЕЛЬ, ЧТОБЫ ОСВОБОДИТЬ ПАМЯТЬ
+    subprocess.run(["ollama", "stop", MODEL], capture_output=True)
+    print(f"[IDEALIST] Модель {MODEL} выгружена из памяти.")
+    
+    return idea
+
+def main():
+    print("[IDEALIST] Запуск Отдела Идеалистов...")
+    
+    if not os.path.exists(FACTORY_DIR):
+        print(f"[IDEALIST] Ошибка: папка фабрики не найдена: {FACTORY_DIR}")
+        return
+    
+    done_tasks = get_success_tasks()
+    print(f"[IDEALIST] Уже сделано задач: {len(done_tasks)}")
+    
+    idea = generate_idea(done_tasks)
+    if not idea:
+        print("[IDEALIST] Не удалось сгенерировать идею. Остановка.")
+        return
+    
+    print(f"\n[IDEALIST] Придумана задача:\n{idea}\n")
+    
+    try:
+        with open(TASK_FILE, "w", encoding="utf-8") as f:
+            f.write(idea)
+        print(f"[IDEALIST] Задача записана в task.txt")
+    except Exception as e:
+        print(f"[IDEALIST] Ошибка при записи task.txt: {e}")
+        return
+    
+    print("[IDEALIST] Запуск director.py...")
+    try:
+        result = subprocess.run(
+            [sys.executable, DIRECTOR_SCRIPT],
+            cwd=FACTORY_DIR,
+            timeout=3600
+        )
+        if result.returncode != 0:
+            print(f"[IDEALIST] Ошибка: director.py завершился с кодом {result.returncode}.")
+        else:
+            print("[IDEALIST] director.py успешно завершил работу.")
+    except subprocess.TimeoutExpired:
+        print("[IDEALIST] Ошибка: director.py не ответил за 1 час.")
+    except Exception as e:
+        print(f"[IDEALIST] Ошибка при запуске director.py: {e}")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./analyzer.py ===
+import os
+import subprocess
+import re
+
+FACTORY_DIR = os.path.expanduser("~/takcas_factory")
+TASK_FILE = os.path.join(FACTORY_DIR, "task.txt")
+DRAFT_1 = os.path.join(FACTORY_DIR, "draft_1.py")
+DRAFT_ANALYZED = os.path.join(FACTORY_DIR, "draft_analyzed.py")
+MODEL = "qwen2.5-coder:3b"
+
+def clean_code(text):
+    match = re.search(r'```(?:python)?\s*(.*?)```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+def main():
+    print("[ANALYZER] Запуск...")
+    if not os.path.exists(TASK_FILE) or not os.path.exists(DRAFT_1):
+        print("[ANALYZER] Ошибка: нет task.txt или draft_1.py.")
+        return
+    with open(TASK_FILE, "r", encoding="utf-8") as f:
+        task = f.read().strip()
+    with open(DRAFT_1, "r", encoding="utf-8") as f:
+        code = f.read().strip()
+
+    prompt = (
+        "Ты — аналитик. Проверь код на соответствие задаче и исправь синтаксические ошибки. "
+        "Верни ТОЛЬКО исправленный код, без объяснений. "
+        "ВАЖНО: Используй ТОЛЬКО стандартные библиотеки Python. "
+        f"Задача: {task}\n"
+        f"Код:\n{code}"
+    )
+
+    print(f"[ANALYZER] Отправка запроса в Ollama ({MODEL})...")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", MODEL, prompt],
+            capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired:
+        print("[ANALYZER] Ошибка: таймаут.")
+        return
+    except Exception as e:
+        print(f"[ANALYZER] Ошибка: {e}")
+        return
+
+    if result.returncode != 0:
+        print(f"[ANALYZER] Ошибка Ollama: код {result.returncode}")
+        return
+
+    clean = clean_code(result.stdout)
+    if not clean:
+        print("[ANALYZER] Ошибка: пустой ответ.")
+        return
+
+    with open(DRAFT_ANALYZED, "w", encoding="utf-8") as f:
+        f.write(clean)
+    print(f"[ANALYZER] Код сохранен в draft_analyzed.py")
+
+if __name__ == "__main__":
+    main()
+-e 
+
+
+=== FILE: ./draft_1.py ===
+-e 
+
+
+=== FILE: ./draft_analyzed.py ===
+import threading
+import time
+from collections import OrderedDict
+
+class TTLCache:
+    def __init__(self, capacity: int, default_ttl: float, cleanup_interval:[17D[K
+cleanup_interval: float):
+        self.capacity = capacity
+        self.default_ttl = default_ttl
+        self.cleanup_interval = cleanup_interval
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.on_evict = None
+
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.hits += 1
+                self._update_ttl(key)
+                return self.cache[key]
+            else:
+                self.misses += 1
+                return None
+
+    def put(self, key, value, ttl=None):
+        with self.lock:
+            if key in self.cache:
+                self.evictions += 1
+                self.cache.pop(key)
+            self._update_ttl(key, ttl or self.default_ttl)
+            self.cache[key] = value
+            if len(self.cache) > self.capacity:
+                self._evict_lru()
+
+    def _update_ttl(self, key, ttl=None):
+        if ttl is not None:
+            self.cache.move_to_end(key, last=False)
+        else:
+            self.cache.move_to_end(key)
+
+    def _evict_lru(self):
+        with self.lock:
+            while len(self.cache) > self.capacity:
+                key, _ = self.cache.popitem(last=False)
+                self.expirations += 1
+                if self.on_evict:
+                    self.on_evict(key, self.cache[key], "lru")
+
+    def start_cleanup(self):
+        while True:
+            with self.lock:
+                if time.time() - self.last_cleanup > self.cleanup_interval:[22D[K
+self.cleanup_interval:
+                    self._evict_expired()
+            time.sleep(self.cleanup_interval)
+
+    def _evict_expired(self):
+        with self.lock:
+            for key in list(self.cache.keys()):
+                if time.time() - self.cache[key] > self.default_ttl:
+                    self.evictions += 1
+                    if self.on_evict:
+                        self.on_evict(key, self.cache[key], "ttl")
+                    self.cache.pop(key)
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+                "expirations": self.expirations,
+                "size": len(self.cache),
+                "hit_ratio": self.hits / (self.hits + self.misses) if self.[5D[K
+self.hits + self.misses > 0 else 0
+            }
+
+    def set_on_evict(self, callback):
+        self.on_evict = callback
+
+# Тест
+if __name__ == "__main__":
+    cache = TTLCache(capacity=100, default_ttl=0.5, cleanup_interval=0.1)
+    cache.set_on_evict(lambda key, value, reason: print(f"Evicted: {key} du[2D[K
+due to {reason}"))
+
+    threads = []
+    for _ in range(8):
+        thread = threading.Thread(target=lambda: [
+            cache.get(i % 50),
+            cache.put(i % 50, i, 0.05 + 0.15 * (i % 50))
+            for i in range(500)
+        ])
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    stats = cache.get_stats()
+    assert stats["hits"] + stats["misses"] == 4000
+    assert stats["size"] <= 100
+    assert not cache.on_evict_called  # Проверка того, что on_evict не вызы[4D[K
+вызывался под локом
+
+    print(stats)-e 
+
+
+=== FILE: ./logic_errors.txt ===
+-e 
+
+
+=== FILE: ./syntax_errors.txt ===
+-e 
+
+
+=== FILE: ./coder_errors.txt ===
+-e 
+
+
+=== FILE: ./draft_final.py ===
+import threading
+import time
+from collections import OrderedDict
+
+class TTLCache:
+    def __init__(self, capacity: int, default_ttl: float, cleanup_interval:[17D[K
+cleanup_interval: float):
+        self.capacity = capacity
+        self.default_ttl = default_ttl
+        self.cleanup_interval = cleanup_interval
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.expirations = 0
+        self.on_evict = None
+
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.hits += 1
+                self._update_ttl(key)
+                return self.cache[key]
+            else:
+                self.misses += 1
+                return None
+
+    def put(self, key, value, ttl=None):
+        with self.lock:
+            if key in self.cache:
+                self.evictions += 1
+                self.cache.pop(key)
+            self._update_ttl(key, ttl or self.default_ttl)
+            self.cache[key] = value
+            if len(self.cache) > self.capacity:
+                self._evict_lru()
+
+    def _update_ttl(self, key, ttl=None):
+        if ttl is not None:
+            self.cache.move_to_end(key, last=False)
+        else:
+            self.cache.move_to_end(key)
+
+    def _evict_lru(self):
+        with self.lock:
+            while len(self.cache) > self.capacity:
+                key, _ = self.cache.popitem(last=False)
+                self.expirations += 1
+                if self.on_evict:
+                    self.on_evict(key, self.cache[key], "lru")
+
+    def start_cleanup(self):
+        while True:
+            with self.lock:
+                if time.time() - self.last_cleanup > self.cleanup_interval:[22D[K
+self.cleanup_interval:
+                    self._evict_expired()
+            time.sleep(self.cleanup_interval)
+
+    def _evict_expired(self):
+        with self.lock:
+            for key in list(self.cache.keys()):
+                if time.time() - self.cache[key] > self.default_ttl:
+                    self.evictions += 1
+                    if self.on_evict:
+                        self.on_evict(key, self.cache[key], "ttl")
+                    self.cache.pop(key)
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+                "expirations": self.expirations,
+                "size": len(self.cache),
+                "hit_ratio": self.hits / (self.hits + self.misses) if self.[5D[K
+self.hits + self.misses > 0 else 0
+            }
+
+    def set_on_evict(self, callback):
+        self.on_evict = callback
+
+# Тест
+if __name__ == "__main__":
+    cache = TTLCache(capacity=100, default_ttl=0.5, cleanup_interval=0.1)
+    cache.set_on_evict(lambda key, value, reason: print(f"Evicted: {key} du[2D[K
+due to {reason}"))
+
+    threads = []
+    for _ in range(8):
+        thread = threading.Thread(target=lambda: [
+            cache.get(i % 50),
+            cache.put(i % 50, i, 0.05 + 0.15 * (i % 50))
+            for i in range(500)
+        ])
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    stats = cache.get_stats()
+    assert stats["hits"] + stats["misses"] == 4000
+    assert stats["size"] <= 100
+    assert not cache.on_evict_called  # Проверка того, что on_evict не вызы[4D[K
+вызывался под локом
+
+    print(stats)-e 
+
+
